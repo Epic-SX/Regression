@@ -1,0 +1,177 @@
+{
+  "Comment": "Audio Processing State Machine",
+  "StartAt": "InitializeSession",
+  "States": {
+    "InitializeSession": {
+      "Type": "Pass",
+      "Parameters": {
+        "sessionId.$": "$$.Execution.Id"
+      },
+      "ResultPath": "$.sessionData",
+      "Next": "ProcessChunksInParallel"
+    },
+    "ProcessChunksInParallel": {
+      "Type": "Map",
+      "ItemsPath": "$.audioKeys",
+      "Parameters": {
+        "chunkKey.$": "$$.Map.Item.Value",
+        "bucket.$": "$.audioBucket",
+        "sessionId.$": "$.sessionData.sessionId",
+        "chunkIndex.$": "$$.Map.Item.Index",
+        "userId.$": "$.userId"
+      },
+      "MaxConcurrency": 5,
+      "Iterator": {
+        "StartAt": "ProcessSingleChunk",
+        "States": {
+          "ProcessSingleChunk": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${KoenoteLambdaFunctionArn}",
+              "Payload": {
+                "chunkKey.$": "$.chunkKey",
+                "bucket.$": "$.bucket",
+                "sessionId.$": "$.sessionId",
+                "chunkIndex.$": "$.chunkIndex",
+                "userId.$": "$.userId"
+              }
+            },
+            "ResultSelector": {
+              "result.$": "$.Payload.result"
+            },
+            "ResultPath": "$.result",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.result",
+                "Next": "HandleChunkError"
+              }
+            ],
+            "End": true
+          },
+          "HandleChunkError": {
+            "Type": "Pass",
+            "Parameters": {
+              "result": {
+                "chunk.$": "$.chunkKey",
+                "text": "[Processing failed in Step Functions]",
+                "error.$": "$.Error",
+                "cause.$": "$.Cause",
+                "session_id.$": "$.sessionId",
+                "chunk_index.$": "$.chunkIndex"
+              }
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.processedChunks",
+      "Next": "CombineResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "HandleMapError"
+        }
+      ]
+    },
+    "HandleMapError": {
+      "Type": "Pass",
+      "Parameters": {
+        "error.$": "$.error",
+        "message": "Error in parallel processing of chunks",
+        "audioKeys.$": "$.audioKeys",
+        "userId.$": "$.userId",
+        "completeAudioUrl.$": "$.completeAudioUrl",
+        "sessionId.$": "$.sessionData.sessionId"
+      },
+      "Next": "FallbackCombineResults"
+    },
+    "FallbackCombineResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${KoenoteLambdaFunctionArn}",
+        "Payload": {
+          "httpMethod": "POST",
+          "resource": "/koenoto/combine-results",
+          "body": {
+            "transcriptionResults": [
+              {
+                "chunk": "error",
+                "text": "An error occurred during processing. Please try again.",
+                "error.$": "$.error.Error",
+                "cause.$": "$.error.Cause"
+              }
+            ],
+            "completeAudioUrl.$": "$.completeAudioUrl",
+            "userId.$": "$.userId",
+            "sessionId.$": "$.sessionData.sessionId"
+          }
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload.body"
+      },
+      "End": true
+    },
+    "CombineResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${KoenoteLambdaFunctionArn}",
+        "Payload": {
+          "httpMethod": "POST",
+          "resource": "/koenoto/combine-results",
+          "body": {
+            "transcriptionResults.$": "$.processedChunks[*].result.result",
+            "completeAudioUrl.$": "$.completeAudioUrl",
+            "userId.$": "$.userId",
+            "sessionId.$": "$.sessionData.sessionId",
+            "saveToDb": false
+          }
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload.body"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.combineError",
+          "Next": "HandleCombineError"
+        }
+      ],
+      "End": true
+    },
+    "HandleCombineError": {
+      "Type": "Pass",
+      "Parameters": {
+        "error.$": "$.combineError",
+        "message": "Error combining results",
+        "processedChunks.$": "$.processedChunks",
+        "userId.$": "$.userId",
+        "completeAudioUrl.$": "$.completeAudioUrl",
+        "sessionId.$": "$.sessionData.sessionId"
+      },
+      "End": true
+    }
+  }
+} 

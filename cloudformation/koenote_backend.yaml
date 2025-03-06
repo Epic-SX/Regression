@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Koenote Backend SAM Template
+
+Parameters:
+  PublicSubnetAZ:
+    Type: String
+    Default: ap-northeast-1a
+    Description: "Public Subnet AZ (例: ap-northeast-1a)"
+  PrivateSubnetAZ:
+    Type: String
+    Default: ap-northeast-1c
+    Description: "Private Subnet AZ (例: ap-northeast-1c)"
+  OpenAIApiKey:
+    Type: String
+    Description: "OpenAI API Key"
+
+Resources:
+  # ---------------------------------------
+  # 1) API Gateway
+  # ---------------------------------------
+  KoenoteApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+
+  # ---------------------------------------
+  # 2) DynamoDB Table
+  # ---------------------------------------
+  KoenoteRecordingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: KoenoteRecordings
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # ---------------------------------------
+  # 3) S3 Bucket (音声ファイル保存先)
+  # ---------------------------------------
+  KoenoteAudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-regression-audio-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: false
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - HEAD
+              - DELETE
+            AllowedOrigins:
+              - "*"
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+              - x-amz-server-side-encryption
+              - x-amz-request-id
+              - x-amz-id-2
+              - Content-Type
+              - Content-Length
+              - Access-Control-Allow-Origin
+              - Access-Control-Allow-Methods
+              - Access-Control-Allow-Headers
+            MaxAge: 3600
+
+  # BucketPolicy: バケットをパブリック公開するポリシー
+  KoenoteAudioBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KoenoteAudioBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${KoenoteAudioBucket.Arn}/*"
+          - Sid: AllowCORSAccess
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub "${KoenoteAudioBucket.Arn}/*"
+
+  # ---------------------------------------
+  # 4) Lambda Function
+  # ---------------------------------------
+  KoenoteLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess'
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                Resource: !GetAtt KoenoteRecordingsTable.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub "${KoenoteAudioBucket.Arn}"
+                  - !Sub "${KoenoteAudioBucket.Arn}/*"
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:GetExecutionHistory
+                  - states:ListExecutions
+                Resource: 
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:AudioProcessingStateMachine:*"
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:AudioProcessingStateMachine"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:AudioProcessingStateMachine"
+
+  KoenoteLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: KoenoteLambda
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      CodeUri: ../backend/lambda
+      MemorySize: 2048
+      Timeout: 900  # 15 minutes
+      Role: !GetAtt KoenoteLambdaFunctionRole.Arn
+      Environment:
+        Variables:
+          OPENAI_API_KEY: !Ref OpenAIApiKey
+          TABLE_NAME: !Ref KoenoteRecordingsTable
+          AUDIO_BUCKET_NAME: !Ref KoenoteAudioBucket
+      Events:
+        GetKoenoteList:
+          Type: Api
+          Properties:
+            Path: /koenoto
+            Method: GET
+            RestApiId: !Ref KoenoteApi
+        PostKoenoteCreate:
+          Type: Api
+          Properties:
+            Path: /koenoto
+            Method: POST
+            RestApiId: !Ref KoenoteApi
+        GetKoenoteItem:
+          Type: Api
+          Properties:
+            Path: /koenoto/{id}
+            Method: GET
+            RestApiId: !Ref KoenoteApi
+        PutKoenoteItem:
+          Type: Api
+          Properties:
+            Path: /koenoto/{id}
+            Method: PUT
+            RestApiId: !Ref KoenoteApi
+        DeleteKoenoteItem:
+          Type: Api
+          Properties:
+            Path: /koenoto/{id}
+            Method: DELETE
+            RestApiId: !Ref KoenoteApi
+        GetUploadUrl:
+          Type: Api
+          Properties:
+            Path: /koenoto/get-upload-url
+            Method: GET
+            RestApiId: !Ref KoenoteApi
+        PostPresignedUrl:
+          Type: Api
+          Properties:
+            Path: /koenoto/presigned-url
+            Method: POST
+            RestApiId: !Ref KoenoteApi
+        ProcessAudio:
+          Type: Api
+          Properties:
+            Path: /koenoto/process-audio
+            Method: POST
+            RestApiId: !Ref KoenoteApi
+        ProcessChunk:
+          Type: Api
+          Properties:
+            Path: /koenoto/process-chunk
+            Method: POST
+            RestApiId: !Ref KoenoteApi
+        CombineResults:
+          Type: Api
+          Properties:
+            Path: /koenoto/combine-results
+            Method: POST
+            RestApiId: !Ref KoenoteApi
+        ProcessStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref KoenoteApi
+            Path: /koenoto/process-status
+            Method: get
+        SaveRecording:
+          Type: Api
+          Properties:
+            Path: /koenoto/save-recording
+            Method: POST
+            RestApiId: !Ref KoenoteApi
+
+      Layers:
+        - arn:aws:lambda:ap-northeast-1:980921755429:layer:ffmpeg_layer:2
+
+  # ---------------------------------------
+  # 5) Step Functions
+  # ---------------------------------------
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+        - PolicyName: StepFunctionsLambdaInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt KoenoteLambdaFunction.Arn
+
+  AudioProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    DependsOn:
+      - StepFunctionsExecutionRole
+      - KoenoteLambdaFunction
+    Properties:
+      Name: AudioProcessingStateMachine
+      DefinitionUri: ../backend/step_functions/audio_processing.asl.json
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionSubstitutions:
+        KoenoteLambdaFunctionArn: !GetAtt KoenoteLambdaFunction.Arn
+
+  LambdaStepFunctionsPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - KoenoteLambdaFunction
+      - AudioProcessingStateMachine
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KoenoteLambdaFunction
+      Principal: states.amazonaws.com
+      SourceArn: !GetAtt AudioProcessingStateMachine.Arn
+
+  # ---------------------------------------
+  # 6) Custom Resources
+  # ---------------------------------------
+  UpdateLambdaPermissionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: UpdateLambdaPermissions
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 60
+      InlineCode: |
+        import boto3
+        import cfnresponse
+        import json
+        
+        def handler(event, context):
+          try:
+            print(f"Event: {json.dumps(event)}")
+            
+            if event['RequestType'] in ['Create', 'Update']:
+              lambda_client = boto3.client('lambda')
+              
+              function_name = event['ResourceProperties']['FunctionName']
+              step_function_arn = event['ResourceProperties']['StepFunctionArn']
+              
+              # Update Lambda environment variables
+              response = lambda_client.get_function_configuration(
+                FunctionName=function_name
+              )
+              current_env = response.get('Environment', {}).get('Variables', {})
+              current_env['STEP_FUNCTION_ARN'] = step_function_arn
+              
+              lambda_client.update_function_configuration(
+                FunctionName=function_name,
+                Environment={
+                  'Variables': current_env
+                }
+              )
+              
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                'Message': 'Lambda permissions updated successfully'
+              })
+            else:
+              # No action for Delete requests
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                'Message': 'No action required for Delete'
+              })
+          except Exception as e:
+            print(f"Error: {str(e)}")
+            cfnresponse.send(event, context, cfnresponse.FAILED, {
+              'Error': str(e)
+            })
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - lambda:GetFunctionConfiguration
+              - lambda:UpdateFunctionConfiguration
+              - lambda:GetFunction
+            Resource: "*"
+
+  UpdateLambdaPermissions:
+    Type: Custom::UpdateLambdaPermissions
+    DependsOn:
+      - KoenoteLambdaFunction
+      - AudioProcessingStateMachine
+      - UpdateLambdaPermissionsFunction
+    Properties:
+      ServiceToken: !GetAtt UpdateLambdaPermissionsFunction.Arn
+      FunctionName: !Ref KoenoteLambdaFunction
+      StepFunctionArn: !Ref AudioProcessingStateMachine
+
+  IntermediateResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/lambda/
+      Handler: lambda_function.get_intermediate_results
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          AUDIO_BUCKET_NAME: !Ref KoenoteAudioBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref KoenoteAudioBucket
+      Events:
+        GetIntermediateResults:
+          Type: Api
+          Properties:
+            RestApiId: !Ref KoenoteApi
+            Path: /koenoto/intermediate-results
+            Method: get
+
+Outputs:
+  PublicApiEndpoint:
+    Description: "Public HTTP endpoint for Koenote API"
+    Value: !Sub "https://${KoenoteApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    Export:
+      Name: PublicApiEndpoint
+  
+  KoenoteLambdaFunctionArn:
+    Description: "ARN of the Koenote Lambda Function"
+    Value: !GetAtt KoenoteLambdaFunction.Arn
+    Export:
+      Name: KoenoteLambdaFunctionArn
+  
+  AudioProcessingStateMachineArn:
+    Description: "ARN of the Audio Processing State Machine"
+    Value: !Ref AudioProcessingStateMachine
+    Export:
+      Name: AudioProcessingStateMachineArn
